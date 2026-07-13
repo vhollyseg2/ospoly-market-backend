@@ -1,7 +1,7 @@
 {
-  "name": "ospoly-market-backend",
+  "name": "campus-market-backend",
   "version": "1.0.0",
-  "description": "Backend API for Ospoly Market",
+  "description": "Backend API for Campus Market",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

@@ -344,7 +344,7 @@ const uploadImage = async (file, ownerId) => {
   if (!hasCloudinary) throw Object.assign(new Error('Product image storage is not configured. Add Cloudinary variables on Render.'), { statusCode: 503 });
   const dataUri = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
   return cloudinary.uploader.upload(dataUri, {
-    folder: `ospoly-market/products/${ownerId}`,
+    folder: `campus-market/products/${ownerId}`,
     resource_type: 'image',
     transformation: [
       { width: 1600, height: 1600, crop: 'limit' },
@@ -397,8 +397,8 @@ const cartPayload = (cart, destinationState = '') => {
 // -----------------------------------------------------------------------------
 app.get('/api/health', (req, res) => res.json({
   success: true,
-  message: 'Ospoly Market API is running',
-  version: '5.0.0',
+  message: 'Campus Market API is running',
+  version: '6.0.0',
   imageStorageConfigured: hasCloudinary,
   paymentMode: process.env.PAYSTACK_SECRET_KEY ? 'paystack-test-or-live' : 'pay-on-delivery'
 }));
@@ -860,13 +860,32 @@ app.post('/api/chat/send', auth, asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/support/tickets', auth, asyncHandler(async (req, res) => {
+  const message = safeText(req.body.message, 4000);
+  if (message.length < 2) return res.status(400).json({ success: false, message: 'Support message is required' });
   const ticket = await SupportTicket.create({
     user: req.user._id,
     subject: safeText(req.body.subject || 'Support request', 200),
-    message: safeText(req.body.message, 4000),
+    message,
     priority: ['low', 'normal', 'high', 'urgent'].includes(req.body.priority) ? req.body.priority : 'normal'
   });
-  res.status(201).json({ success: true, message: 'Support request sent to the admin team', data: { ticket } });
+  res.status(201).json({ success: true, message: 'Support request sent only to admins and moderators', data: { ticket } });
+}));
+
+app.get('/api/support/tickets/my', auth, asyncHandler(async (req, res) => {
+  const tickets = await SupportTicket.find({ user: req.user._id }).populate('replies.from', 'name role').sort('-updatedAt').limit(30).lean();
+  res.json({ success: true, data: { tickets } });
+}));
+
+app.post('/api/support/tickets/:id/reply', auth, asyncHandler(async (req, res) => {
+  const message = safeText(req.body.message, 2000);
+  if (!message) return res.status(400).json({ success: false, message: 'Message is required' });
+  const ticket = await SupportTicket.findOne({ _id: req.params.id, user: req.user._id });
+  if (!ticket) return res.status(404).json({ success: false, message: 'Support ticket not found' });
+  if (ticket.status === 'closed') return res.status(400).json({ success: false, message: 'This support conversation is closed' });
+  ticket.replies.push({ from: req.user._id, message });
+  if (ticket.status === 'resolved') ticket.status = 'open';
+  await ticket.save();
+  res.status(201).json({ success: true, data: { ticket } });
 }));
 
 // -----------------------------------------------------------------------------
@@ -903,6 +922,28 @@ app.get('/api/admin/dashboard', auth, allowRoles('admin', 'moderator'), asyncHan
   ]);
   const paidRevenue = await Order.aggregate([{ $match: { paymentStatus: 'paid' } }, { $group: { _id: null, total: { $sum: '$finalAmount' } } }]);
   res.json({ success: true, data: { stats: { totalUsers, totalSellers, totalProducts, totalOrders, totalRevenue: paidRevenue[0]?.total || 0, pendingApprovals: pendingProducts + pendingSellers + openReports + openTickets + pendingWithdrawals } } });
+}));
+
+app.get('/api/admin/moderators', auth, allowRoles('admin'), asyncHandler(async (req, res) => {
+  const moderators = await User.find({ role: 'moderator' }).select('name email phone isBanned createdAt').sort('-createdAt').lean();
+  res.json({ success: true, data: { moderators } });
+}));
+
+app.post('/api/admin/moderators', auth, allowRoles('admin'), asyncHandler(async (req, res) => {
+  const name = safeText(req.body.name, 100);
+  const email = normalizeEmail(req.body.email);
+  const password = String(req.body.password || '');
+  if (name.length < 2 || !/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ success: false, message: 'Valid moderator name and email are required' });
+  if (password.length < 10) return res.status(400).json({ success: false, message: 'Temporary password must have at least 10 characters' });
+  if (await User.exists({ email })) return res.status(409).json({ success: false, message: 'An account already uses this email' });
+  const moderator = await User.create({ name, email, password, role: 'moderator', isVerified: true });
+  res.status(201).json({ success: true, message: 'Moderator account created. Ask them to change the temporary password after signing in.', data: { moderator: publicUser(moderator) } });
+}));
+
+app.delete('/api/admin/moderators/:id', auth, allowRoles('admin'), asyncHandler(async (req, res) => {
+  const moderator = await User.findOneAndUpdate({ _id: req.params.id, role: 'moderator' }, { $set: { role: 'buyer' } }, { new: true });
+  if (!moderator) return res.status(404).json({ success: false, message: 'Moderator not found' });
+  res.json({ success: true, message: 'Moderator access removed' });
 }));
 
 app.get('/api/admin/pending-products', auth, allowRoles('admin', 'moderator'), asyncHandler(async (req, res) => {
@@ -952,8 +993,28 @@ app.put('/api/admin/orders/:id/:action', auth, allowRoles('admin'), asyncHandler
 }));
 
 app.get('/api/admin/support-tickets', auth, allowRoles('admin', 'moderator'), asyncHandler(async (req, res) => {
-  const tickets = await SupportTicket.find().populate('user', 'name email role').sort('-createdAt').lean();
+  const tickets = await SupportTicket.find().populate('user', 'name email role').populate('replies.from', 'name role').sort('-updatedAt').lean();
   res.json({ success: true, data: { tickets } });
+}));
+
+app.post('/api/admin/support-tickets/:id/reply', auth, allowRoles('admin', 'moderator'), asyncHandler(async (req, res) => {
+  const message = safeText(req.body.message, 2000);
+  if (!message) return res.status(400).json({ success: false, message: 'Reply is required' });
+  const ticket = await SupportTicket.findById(req.params.id);
+  if (!ticket) return res.status(404).json({ success: false, message: 'Support ticket not found' });
+  ticket.replies.push({ from: req.user._id, message });
+  ticket.status = req.body.resolve === true ? 'resolved' : 'in_progress';
+  await ticket.save();
+  await ticket.populate([{ path: 'user', select: 'name email role' }, { path: 'replies.from', select: 'name role' }]);
+  res.status(201).json({ success: true, data: { ticket } });
+}));
+
+app.put('/api/admin/support-tickets/:id/status', auth, allowRoles('admin', 'moderator'), asyncHandler(async (req, res) => {
+  const status = safeText(req.body.status, 30);
+  if (!['open', 'in_progress', 'resolved', 'closed'].includes(status)) return res.status(400).json({ success: false, message: 'Invalid ticket status' });
+  const ticket = await SupportTicket.findByIdAndUpdate(req.params.id, { $set: { status } }, { new: true });
+  if (!ticket) return res.status(404).json({ success: false, message: 'Support ticket not found' });
+  res.json({ success: true, data: { ticket } });
 }));
 
 app.get('/api/admin/withdrawals', auth, allowRoles('admin'), asyncHandler(async (req, res) => {
@@ -978,7 +1039,7 @@ app.use((error, req, res, next) => {
 });
 
 connectDB()
-  .then(() => app.listen(PORT, () => console.log(`🚀 Ospoly Market API v5 running on port ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`🚀 Campus Market API v6 running on port ${PORT}`)))
   .catch(error => {
     console.error('❌ Failed to start server:', error.message);
     process.exit(1);
